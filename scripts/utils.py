@@ -15,9 +15,10 @@ import lightning as L
 def prep_df(path_to_df: str):
     print("[ LOG ] Preparing df for processing...")
     df = pd.read_csv(path_to_df, sep="\t")
+    df.drop(['utterances', 'timings'], axis=1, inplace=True)
+
     group_col = "uid"
     cols_as_list = MODELS
-    df.drop(['utterances', 'timings'], axis=1, inplace=True)
 
     # read vals as list
     for col in cols_as_list:
@@ -34,13 +35,18 @@ def prep_df(path_to_df: str):
             agg_dict[col] = 'mean'
 
     df = df.groupby(group_col, as_index=False).agg(agg_dict)
+
+    # NOTE: set PATIENT ID, not RECORDING ID. i.e. 001-0 becomes 001. Prevents data leaks.
+    # Also NOTE: do this only after merging utterances per recording. Otherwise u will merge utterance per recording and recording per user at the same time
+    df["uid"] = df["uid"].apply(lambda x: str(x).split("-")[0])
+
     df.to_csv("data/processed/pitt-chk-1.df", index=False)
     with open("data/processed/pitt-chk-1.info", "w") as fout:
         df.info(buf=fout)
     dem_count = df['dementia'].value_counts().get(1, 0)
     con_count = df['dementia'].value_counts().get(0, 0)
     print(f"[ LOG ] Label distribution:\nDementia: {dem_count}\nControl: {con_count} ")
-    return df, dem_count, con_count
+    return df
 
 class VoxStackDataset(Dataset):
     def __init__(self, df, embedding_column):
@@ -102,77 +108,6 @@ class VoxStackDataset(Dataset):
             "embedding": embedding,
             "label": label
         }
-
-class VoxStackDataModule(L.LightningDataModule):
-    def __init__(self, df, embedding_column, batch_size=32):
-        super().__init__()
-        self.df = df
-        self.embedding_column = embedding_column
-        self.batch_size = batch_size
-
-    def setup(self, stage=None):
-        train_df, val_df = train_test_split(
-            self.df,
-            test_size=0.2,
-            stratify=self.df["dementia"],
-            random_state=42
-        )
-
-        quant_cols = [
-            "utterance_times",
-            "phonological_frags_count",
-            "fillers_count"
-        ]
-
-        embedding_cols = [
-            "BAAI/bge-base-en-v1.5",
-            "BAAI/bge-m3",
-            "BAAI/bge-large-en-v1.5"
-        ]
-
-        acoustic_cols = [
-            col for col in self.df.columns
-            if col not in (
-                ["uid", "dementia"]
-                + quant_cols
-                + embedding_cols
-            )
-        ]
-
-        # Scale quant + acoustic together
-        scaler = StandardScaler()
-
-        train_df[quant_cols + acoustic_cols] = scaler.fit_transform(
-            train_df[quant_cols + acoustic_cols]
-        )
-
-        val_df[quant_cols + acoustic_cols] = scaler.transform(
-            val_df[quant_cols + acoustic_cols]
-        )
-
-        self.train_dataset = VoxStackDataset(
-            train_df, self.embedding_column
-        )
-
-        self.val_dataset = VoxStackDataset(
-            val_df, self.embedding_column
-        )
-
-    def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=4
-        )
-
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=4
-        )
 
 def prep_shap_data(df, emb_col):
     quant_cols = ["utterance_times", "phonological_frags_count", "fillers_count"]

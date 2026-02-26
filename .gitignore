@@ -2,3 +2,4 @@
 data/*
 !data/shap.log
 !data/train_res.log
+*/__pycache__/*

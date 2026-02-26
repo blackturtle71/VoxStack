@@ -8,7 +8,7 @@ from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.callbacks import ModelCheckpoint
 import torch
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler
 import numpy as np
 from sklearn.metrics import roc_auc_score, f1_score
@@ -20,7 +20,7 @@ from pathlib import Path
 import warnings
 warnings.filterwarnings("ignore")
 
-N_FOLDS=5
+N_FOLDS=10
 
 PATH_TO_DF="data/processed/pitt.tsv"
 LOG_PATH="data/logs/"
@@ -34,7 +34,7 @@ class VoxStack(L.LightningModule):
     def __init__(
         self,
         embedding_dim,
-        lr=1e-3,
+        lr=5e-4,
         weight=None
     ):
         super().__init__()
@@ -42,43 +42,45 @@ class VoxStack(L.LightningModule):
 
         self.quant_net = nn.Sequential(
             nn.Linear(3, 16),
-            nn.ReLU(),
+            nn.BatchNorm1d(16),
+            nn.GELU(),
             nn.Dropout(0.2),
-            nn.Linear(16, 4),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(4, 2),
-            nn.ReLU(),
-            nn.Dropout(0.5),
+            nn.Linear(16, 8),
+            nn.BatchNorm1d(8),
+            nn.GELU(),
+            nn.Dropout(0.3),
         )
 
         self.acoustic_net = nn.Sequential(
             nn.Linear(88, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.Dropout(0.5),
             nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Dropout(0.4)
+            nn.BatchNorm1d(64),
+            nn.GELU(),
         )
 
         self.embedding_net = nn.Sequential(
             nn.Linear(embedding_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.BatchNorm1d(256),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            #nn.Linear(256, 128),
+            #nn.GELU(),
         )
 
         self.classifier = nn.Sequential(
-            nn.Linear(2 + 32 + 256, 64),
-            nn.ReLU(),
+            nn.Linear(8 + 64 + 256, 64),
+            nn.BatchNorm1d(64),
+            nn.GELU(),
             nn.Dropout(0.3),
             nn.Linear(64, 1)
         )
 
         if weight is not None:
             self.criterion = nn.BCEWithLogitsLoss(
-                weight=torch.tensor([weight])
+                pos_weight=torch.tensor([weight])
             )
         else:
             self.criterion = nn.BCEWithLogitsLoss()
@@ -107,8 +109,9 @@ class VoxStack(L.LightningModule):
 
         probs = torch.sigmoid(logits).squeeze(1)
 
-        self.log("train_loss", loss, prog_bar=True)
-        self.log("train_auc", self.auroc(probs, y.int()), prog_bar=True)
+        self.log("train_loss", loss, prog_bar=True, on_epoch=True)
+        self.auroc.update(probs, y.int())
+        self.log("train_auc", self.auroc, prog_bar=True, on_epoch=True)
 
         return loss
 
@@ -123,15 +126,32 @@ class VoxStack(L.LightningModule):
         loss = self.criterion(logits.squeeze(1), y)
         probs = torch.sigmoid(logits).squeeze(1)
 
-        self.log("val_loss", loss, prog_bar=True)
-        self.log("val_auc", self.auroc(probs, y.int()), prog_bar=True)
-        self.log("val_f1", self.f1(probs, y.int()), prog_bar=True)
+        self.log("val_loss", loss, prog_bar=True, on_epoch=True)
+        self.auroc.update(probs, y.int())
+        self.log("val_auc", self.auroc(probs, y.int()), prog_bar=True, on_epoch=True)
+        self.f1.update(probs, y.int())
+        self.log("val_f1", self.f1(probs, y.int()), prog_bar=True, on_epoch=True)
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=0.5,
+            patience=2
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_auc"
+            }
+        }
 
 def evaluate_model(model, dataloader):
-    model.eval()
+    model.eval().float()
     preds, targets = [], []
 
     with torch.no_grad():
@@ -146,10 +166,10 @@ def evaluate_model(model, dataloader):
     return auc, f1
 
 def run_trainer():
-    df, dem_count, con_count = prep_df(PATH_TO_DF)
-    weight = min(dem_count, con_count)/max(dem_count, con_count)
+    df = prep_df(PATH_TO_DF)
 
-    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True)
+    # takes into account that the same uid shouldn't be in val_df and train_df at the same time
+    sgkf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True)
     labels = df["dementia"].values
 
     val_dfs_per_fold = {emb_model: [] for emb_model in MODELS}
@@ -167,7 +187,7 @@ def run_trainer():
         print(f"[LOG] Detected embedding dimension: {emb_model_name}")
 
         fold_idx = 0
-        for train_idx, val_idx in skf.split(df, labels):
+        for train_idx, val_idx in sgkf.split(df, y=labels, groups=df["uid"]):
             safe_name = emb_model_name.split("/")[1] if "/" in emb_model_name else emb_model_name
             l_logger = TensorBoardLogger(
                 save_dir=LOG_PATH,
@@ -179,6 +199,16 @@ def run_trainer():
             train_df = df.iloc[train_idx].reset_index(drop=True)
             val_df = df.iloc[val_idx].reset_index(drop=True)
             val_dfs_per_fold[emb_model_name].append(val_df.copy())
+
+            train_patients = set(train_df["uid"])
+            val_patients = set(val_df["uid"])
+
+            assert len(train_patients.intersection(val_patients)) == 0, "DATA LEAK!!! UID exists both in val_df and train_df!"
+
+            # calculate weights (per fold calc is safer)
+            dem_count = train_df["dementia"].sum()
+            con_count = len(train_df) - dem_count
+            weight = min(dem_count, con_count) / max(dem_count, con_count)
 
             # Scale quantitative + acoustic features
             quant_cols = ["utterance_times", "phonological_frags_count", "fillers_count"]
@@ -265,7 +295,7 @@ def run_shap(val_dfs_per_fold: dict):
             model = VoxStack.load_from_checkpoint(model_path,
                                                   embedding_dim=len(prep_shap_data(val_df,emb_model_name)[2][0]),
                                                   weights_only=False)
-            model.to(device)
+            model.to(device).float()
             model.eval()
 
             quant_val, acoustic_val, emb_val = prep_shap_data(val_df, emb_model_name)
