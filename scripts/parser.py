@@ -40,6 +40,8 @@ def parse_cha(dir_path: str):
     phonological_frags_count = []
     fillers_count = []
     speech_event_count = [] # like growls, laughs and so on
+    letters_per_utterance = []
+    words_per_utterance = []
 
     for file in files:
         with open(file, 'r', encoding='utf-8', errors="ignore") as fin:
@@ -106,11 +108,22 @@ def parse_cha(dir_path: str):
                     line = re.sub(r'\s+', ' ', line).strip() # colapse multiple spaces (from cleaning)
                     utterances.append(line)
 
+                    line = line.replace(r'.', " ")
+                    line = line.replace(r',', " ")
+                    line = line.replace(r'!', " ")
+                    line = line.replace(r'?', " ")
+
+                    line = re.sub(r'\s+', ' ', line).strip() # colapse multiple spaces (from cleaning)
+                    letters_per_utterance.append(len(line))
+                    words_per_utterance.append(len(line.split()))
+
 
     parsed = {"uid": uid,
               "dementia": flag,
               "utterances": utterances,
               "utterance_times": utterance_times,
+              "letters_per_utterance": letters_per_utterance,
+              "words_per_utterance": words_per_utterance,
               "timings": timings,
               "phonological_frags_count": phonological_frags_count,
               "fillers_count": fillers_count
@@ -124,19 +137,6 @@ def parse_cha(dir_path: str):
         df.dropna(subset=["timings"], inplace=True)
 
     return df
-
-#def _load_model(model_name: str):
-#    model = FlagAutoModel.from_finetuned(
-#        model_name
-#    )
-#    return model
-
-#def embed(utterance: str, model: FlagAutoModel):
-#    emb = model.encode(utterance)
-#    if isinstance(emb, dict):
-#        return emb['dense_vecs'].tolist()
-#    elif isinstance(emb, np.ndarray):
-#        return emb.tolist()
 
 def _load_model(model_name: str, device: str ="cuda"):
     tokenizer = AutoTokenizer.from_pretrained(model_name)

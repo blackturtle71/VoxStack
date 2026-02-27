@@ -34,11 +34,17 @@ def prep_df(path_to_df: str):
         else:
             agg_dict[col] = 'mean'
 
+    # NOTE: set PATIENT ID, not RECORDING ID. i.e. 001-0 becomes 001. Prevents data leaks.
+    # Also NOTE: merges utterance per recording and recording per user at the same time
+    df["uid"] = df["uid"].apply(lambda x: str(x).split("-")[0])
+
     df = df.groupby(group_col, as_index=False).agg(agg_dict)
 
-    # NOTE: set PATIENT ID, not RECORDING ID. i.e. 001-0 becomes 001. Prevents data leaks.
-    # Also NOTE: do this only after merging utterances per recording. Otherwise u will merge utterance per recording and recording per user at the same time
-    df["uid"] = df["uid"].apply(lambda x: str(x).split("-")[0])
+    # convert float markers to int to avoid potential errors
+    df['dementia'] = df['dementia'].astype(int).values
+
+    # convert milliseconds to seconds
+    df['utterance_times'] /= 1000
 
     df.to_csv("data/processed/pitt-chk-1.df", index=False)
     with open("data/processed/pitt-chk-1.info", "w") as fout:
@@ -58,7 +64,9 @@ class VoxStackDataset(Dataset):
         self.quant_cols = [
             "utterance_times",
             "phonological_frags_count",
-            "fillers_count"
+            "fillers_count",
+            "letters_per_utterance",
+            "words_per_utterance"
         ]
 
         # Embedding columns
@@ -110,7 +118,7 @@ class VoxStackDataset(Dataset):
         }
 
 def prep_shap_data(df, emb_col):
-    quant_cols = ["utterance_times", "phonological_frags_count", "fillers_count"]
+    quant_cols = ["utterance_times", "phonological_frags_count", "fillers_count", "letters_per_utterance", "words_per_utterance"]
     embedding_cols = MODELS
     acoustic_cols = [c for c in df.columns if c not in ["uid","dementia"] + quant_cols + embedding_cols]
 

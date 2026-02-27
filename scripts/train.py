@@ -41,14 +41,14 @@ class VoxStack(L.LightningModule):
         self.save_hyperparameters()
 
         self.quant_net = nn.Sequential(
-            nn.Linear(3, 16),
+            nn.Linear(5, 16),
             nn.BatchNorm1d(16),
             nn.GELU(),
             nn.Dropout(0.2),
             nn.Linear(16, 8),
             nn.BatchNorm1d(8),
             nn.GELU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.8),
         )
 
         self.acoustic_net = nn.Sequential(
@@ -65,18 +65,25 @@ class VoxStack(L.LightningModule):
             nn.Linear(embedding_dim, 256),
             nn.BatchNorm1d(256),
             nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
             nn.Dropout(0.2),
-            #nn.Linear(256, 128),
-            #nn.GELU(),
         )
 
         self.classifier = nn.Sequential(
-            nn.Linear(8 + 64 + 256, 64),
+            nn.Linear(8 + 64 + 128, 64),
             nn.BatchNorm1d(64),
             nn.GELU(),
             nn.Dropout(0.3),
             nn.Linear(64, 1)
         )
+
+        # Learnable branch weights (adjusted by optimizer)
+        self.alpha_quant = nn.Parameter(torch.tensor(1.0))
+        self.alpha_acoustic = nn.Parameter(torch.tensor(1.0))
+        self.alpha_embedding = nn.Parameter(torch.tensor(1.0))
 
         if weight is not None:
             self.criterion = nn.BCEWithLogitsLoss(
@@ -85,15 +92,21 @@ class VoxStack(L.LightningModule):
         else:
             self.criterion = nn.BCEWithLogitsLoss()
 
-        self.auroc = BinaryAUROC()
-        self.f1 = BinaryF1Score()
+        self.train_auc = BinaryAUROC()
+        self.val_auc = BinaryAUROC()
+        self.val_f1 = BinaryF1Score()
 
     def forward(self, quant, acoustic, embedding):
         q = self.quant_net(quant)
         a = self.acoustic_net(acoustic)
         e = self.embedding_net(embedding)
 
-        fused = torch.cat([q, a, e], dim=1)
+        # add weights to branches (also  use softplus to avoid negative values)
+        q_scaled = q * torch.nn.functional.softplus(self.alpha_quant)
+        a_scaled = a * torch.nn.functional.softplus(self.alpha_acoustic)
+        e_scaled = e * torch.nn.functional.softplus(self.alpha_embedding)
+
+        fused = torch.cat([q_scaled, a_scaled, e_scaled], dim=1)
         logits = self.classifier(fused)
         return logits
 
@@ -110,8 +123,8 @@ class VoxStack(L.LightningModule):
         probs = torch.sigmoid(logits).squeeze(1)
 
         self.log("train_loss", loss, prog_bar=True, on_epoch=True)
-        self.auroc.update(probs, y.int())
-        self.log("train_auc", self.auroc, prog_bar=True, on_epoch=True)
+        self.train_auc.update(probs, y.int())
+        self.log("train_auc", self.train_auc, prog_bar=True, on_epoch=True)
 
         return loss
 
@@ -127,10 +140,10 @@ class VoxStack(L.LightningModule):
         probs = torch.sigmoid(logits).squeeze(1)
 
         self.log("val_loss", loss, prog_bar=True, on_epoch=True)
-        self.auroc.update(probs, y.int())
-        self.log("val_auc", self.auroc(probs, y.int()), prog_bar=True, on_epoch=True)
-        self.f1.update(probs, y.int())
-        self.log("val_f1", self.f1(probs, y.int()), prog_bar=True, on_epoch=True)
+        self.val_auc.update(probs, y.int())
+        self.log("val_auc", self.val_auc, prog_bar=True, on_epoch=True)
+        self.val_f1.update(probs, y.int())
+        self.log("val_f1", self.val_f1, prog_bar=True, on_epoch=True)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
@@ -150,13 +163,13 @@ class VoxStack(L.LightningModule):
             }
         }
 
-def evaluate_model(model, dataloader):
+def evaluate_model(model, dataloader, device="cuda"):
     model.eval().float()
     preds, targets = [], []
 
     with torch.no_grad():
         for batch in dataloader:
-            logits = model(batch["quant"], batch["acoustic"], batch["embedding"])
+            logits = model(batch["quant"].to(device), batch["acoustic"].to(device), batch["embedding"].to(device))
             probs = torch.sigmoid(logits)
             preds.extend(probs.cpu().numpy())
             targets.extend(batch["label"].cpu().numpy())
@@ -208,16 +221,26 @@ def run_trainer():
             # calculate weights (per fold calc is safer)
             dem_count = train_df["dementia"].sum()
             con_count = len(train_df) - dem_count
-            weight = min(dem_count, con_count) / max(dem_count, con_count)
+            weight = con_count / dem_count
 
-            # Scale quantitative + acoustic features
-            quant_cols = ["utterance_times", "phonological_frags_count", "fillers_count"]
+            # Scale features
+            quant_cols = ["utterance_times", "phonological_frags_count", "fillers_count", "letters_per_utterance", "words_per_utterance"]
             embedding_cols = MODELS
             acoustic_cols = [c for c in df.columns if c not in ["uid","dementia"] + quant_cols + embedding_cols]
 
             scaler = StandardScaler()
             train_df[quant_cols + acoustic_cols] = scaler.fit_transform(train_df[quant_cols + acoustic_cols])
             val_df[quant_cols + acoustic_cols] = scaler.transform(val_df[quant_cols + acoustic_cols])
+
+            scaler_emb = StandardScaler()
+            emb_matrix = np.vstack(train_df[emb_model_name].values)
+            train_scaled = scaler_emb.fit_transform(emb_matrix)
+            train_df[emb_model_name] = list(train_scaled)
+
+            val_matrix = np.vstack(val_df[emb_model_name].values)
+            val_scaled = scaler_emb.transform(val_matrix)
+            val_df[emb_model_name] = list(val_scaled)
+
 
             train_dataset = VoxStackDataset(train_df, emb_model_name)
             val_dataset = VoxStackDataset(val_df, emb_model_name)
@@ -259,15 +282,22 @@ def run_trainer():
             trainer.fit(model, train_loader, val_loader)
 
             # Evaluate
-            auc, f1 = evaluate_model(model, val_loader)
+            best_model = VoxStack.load_from_checkpoint(
+                trainer.checkpoint_callback.best_model_path,
+                embedding_dim=len(val_df[emb_model_name][0]),
+                weights_only=False
+            )
+            best_model.to("cuda")
+
+            auc, f1 = evaluate_model(best_model, val_loader)
             print(f"[LOG] Fold {fold_idx} AUC={auc:.3f}, F1={f1:.3f}")
             aucs.append(auc)
             f1s.append(f1)
 
-            # Average metrics across folds
-            with open ("data/train_res.log", "a") as fout:
-                print(f"[RESULT] Embedding: {emb_model_name} | Avg AUC={np.mean(aucs):.3f}, Avg F1={np.mean(f1s):.3f}")
-                fout.write(f"[RESULT] Embedding: {emb_model_name} | Avg AUC={np.mean(aucs):.3f}, Avg F1={np.mean(f1s):.3f}\n")
+        # Average metrics across folds
+        with open ("data/train_res.log", "a") as fout:
+            print(f"[RESULT] Embedding: {emb_model_name} | Avg AUC={np.mean(aucs):.3f}, Avg F1={np.mean(f1s):.3f}")
+            fout.write(f"[RESULT] Embedding: {emb_model_name} | Avg AUC={np.mean(aucs):.3f}, Avg F1={np.mean(f1s):.3f}\n")
 
     return val_dfs_per_fold
 
@@ -322,7 +352,7 @@ def run_shap(val_dfs_per_fold: dict):
         shap_acoustic_mean = _aggregate_branch(shap_acoustic_all)
         shap_embedding_mean = _aggregate_branch(shap_embedding_all)
 
-        quant_cols = ["utterance_times", "phonological_frags_count", "fillers_count"]
+        quant_cols = ["utterance_times", "phonological_frags_count", "fillers_count", "letters_per_utterance", "words_per_utterance"]
         embedding_cols = MODELS
         acoustic_cols = [c for c in val_df.columns if c not in ["uid","dementia"] + quant_cols + embedding_cols]
 
